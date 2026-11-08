@@ -1,10 +1,18 @@
 import asyncio
+from enum import Enum
 import signal
 import time
 from typing import Callable, Dict, List, Optional
 from nexus.broker import RedisBroker
 from nexus.models import TaskDefinition, TaskPriority, TaskResult, TaskStatus
 from nexus.retry import calculate_backoff
+
+class WorkerState(str, Enum):
+    """Explicit lifecycle state machine for Nexus workers."""
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    DRAINING = "draining"
 
 class NexusWorker:
     def __init__(
@@ -19,14 +27,21 @@ class NexusWorker:
         self.priorities = priorities or [TaskPriority.HIGH, TaskPriority.DEFAULT, TaskPriority.LOW]
         self.registry = registry or {}
         self.semaphore = asyncio.Semaphore(concurrency)
-        self.running = False
+        self.state = WorkerState.STOPPED
         self._tasks: set[asyncio.Task] = set()
+
+    @property
+    def running(self) -> bool:
+        """Backward-compatibility property for running check."""
+        return self.state == WorkerState.RUNNING
 
     def register(self, name: str, fn: Callable):
         self.registry[name] = fn
 
     async def start(self):
-        self.running = True
+        if self.state == WorkerState.RUNNING:
+            return
+        self.state = WorkerState.STARTING
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -34,10 +49,15 @@ class NexusWorker:
             except NotImplementedError:
                 pass  # Windows support
 
+        self.state = WorkerState.RUNNING
         print(f"🚀 NexusWorker started (concurrency={self.concurrency}, queues={[p.value for p in self.priorities]})")
 
-        while self.running:
+        while self.state == WorkerState.RUNNING:
             await self.semaphore.acquire()
+            if self.state != WorkerState.RUNNING:
+                self.semaphore.release()
+                break
+
             task = await self.broker.fetch_next(self.priorities)
             if not task:
                 self.semaphore.release()
@@ -50,6 +70,7 @@ class NexusWorker:
 
     async def _execute_wrapper(self, task: TaskDefinition):
         try:
+            task.transition_to(TaskStatus.RUNNING)
             fn = self.registry.get(task.name)
             if not fn:
                 raise ValueError(f"Task '{task.name}' not registered on worker")
@@ -61,6 +82,7 @@ class NexusWorker:
                 res = fn(*task.args, **task.kwargs)
 
             elapsed = time.time() - start_t
+            task.transition_to(TaskStatus.COMPLETED)
             result = TaskResult(
                 task_id=task.id,
                 status=TaskStatus.COMPLETED,
@@ -76,19 +98,22 @@ class NexusWorker:
                 task.retry_count += 1
                 delay = calculate_backoff(task.retry_count)
                 task.execute_at = time.time() + delay
+                task.transition_to(TaskStatus.RETRYING)
+                task.transition_to(TaskStatus.PENDING)
                 print(f"🔄 Retrying [{task.id[:8]}] attempt {task.retry_count}/{task.max_retries} in {delay:.1f}s")
                 await self.broker.enqueue(task)
             else:
                 print(f"💀 Exhausted retries for [{task.id[:8]}]. Moving to Dead Letter Queue.")
+                task.transition_to(TaskStatus.DEAD_LETTER)
                 await self.broker.mark_dead_letter(task, str(exc))
         finally:
             self.semaphore.release()
 
     async def stop(self):
-        print("
-🛑 Gracefully shutting down worker...")
-        self.running = False
+        print("\n🛑 Gracefully shutting down worker...")
+        self.state = WorkerState.DRAINING
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.broker.close()
+        self.state = WorkerState.STOPPED
         print("👋 Worker stopped cleanly.")

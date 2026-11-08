@@ -63,6 +63,13 @@ class RedisBroker:
     async def mark_dead_letter(self, task: TaskDefinition, error: str):
         await self.connect()
         data = task.model_dump()
+        # Redact sensitive parameters in dead letter queue to prevent credential leaks
+        if "kwargs" in data and isinstance(data["kwargs"], dict):
+            sensitive_patterns = {"password", "token", "secret", "api_key", "private_key", "auth", "key"}
+            data["kwargs"] = {
+                k: ("[REDACTED]" if any(s in k.lower() for s in sensitive_patterns) else v)
+                for k, v in data["kwargs"].items()
+            }
         data["last_error"] = error
         await self.client.lpush("nexus:dlq", json.dumps(data))
         await self.client.hincrby("nexus:stats", "dead_letter", 1)
